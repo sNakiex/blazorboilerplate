@@ -119,6 +119,7 @@ Test out with SQLlite / file db. Then test out with a known good connection stri
  - External Authentication (Google, Twitter) Thanks [acid12](https://github.com/acid12)
  - Known Issues:
     - Drag and Drop example does not work in FF. Known FF issue.
+    - Publish on IIS "blazor.webassembly.js" undefined 'map' error - could be user specific
 
 ### 0.3.2 
 - Identity Server 4 - Authentication with ASP.Net Identity Authorization with Policies  
