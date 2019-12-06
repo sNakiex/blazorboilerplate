@@ -1,7 +1,5 @@
 ﻿using BlazorBoilerplate.Client.Services.Contracts;
-using BlazorBoilerplate.Client.States;
 using BlazorBoilerplate.Shared.Dto;
-using Microsoft.AspNetCore.Components.Authorization;
 using Newtonsoft.Json;
 using System;
 using System.Threading.Tasks;

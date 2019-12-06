@@ -36,7 +36,7 @@ namespace BlazorBoilerplate.Client.States
         }
 
         public async Task<ApiResponseDto> Create(RegisterDto registerParameters)
-        {            
+        {
             ApiResponseDto apiResponse = await _authorizeApi.Create(registerParameters);
             return apiResponse;
         }
@@ -71,7 +71,7 @@ namespace BlazorBoilerplate.Client.States
         }
 
         public async Task<UserInfoDto> GetUserInfo()
-        {            
+        {
             if (_userInfoCache != null && _userInfoCache.IsAuthenticated)
             {
                 return _userInfoCache;

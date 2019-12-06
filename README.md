@@ -81,6 +81,7 @@ I have taken small solutions from other repositories and will do my best to reco
  - Forum chat and notification system - Thanks <a href="https://github.com/ajgoldenwings" target="_blank">ajgoldenwings</a>
  - Drag and Drop Examples - <a href="https://chrissainty.com/investigating-drag-and-drop-with-blazor/" target="_blank">Chris Sainty Blazor Blog</a>
  - Docker Container Support
+ - External Authentication (Google, Twitter)
 
 ## Road map
 - User profile & settings management
@@ -115,6 +116,7 @@ Test out with SQLlite / file db. Then test out with a known good connection stri
 ### 0.4.0 (Under Development)
  - Docker Support. Thanks [npraskins](https://github.com/npraskins) & [acid12](https://github.com/acid12)
  - Fixed IAuditable / ShadowProperties for CreatedOn, CreatedBy, ModifiedOn, ModifiedBy.  Thanks [acid12](https://github.com/acid12)
+ - External Authentication (Google, Twitter) Thanks [acid12](https://github.com/acid12)
  - Known Issues:
     - Drag and Drop example does not work in FF. Known FF issue.
 
