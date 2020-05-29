@@ -1,34 +1,60 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+using System.Threading.Tasks;
+
 using AutoMapper;
+#if ServerSideBlazor
+
+using BlazorBoilerplate.CommonUI;
+using BlazorBoilerplate.CommonUI.Services.Contracts;
+using BlazorBoilerplate.CommonUI.Services.Implementations;
+using BlazorBoilerplate.CommonUI.States;
+
+using MatBlazor;
+
+using Microsoft.AspNetCore.Components.Authorization;
+using Microsoft.AspNetCore.Components;
+
+using System.Net.Http;
+
+#endif
+
 using BlazorBoilerplate.Server.Authorization;
-using BlazorBoilerplate.Server.Data;
-using BlazorBoilerplate.Server.Data.Interfaces;
-using BlazorBoilerplate.Server.Data.Mapping;
 using BlazorBoilerplate.Server.Helpers;
+using BlazorBoilerplate.Server.Managers;
 using BlazorBoilerplate.Server.Middleware;
-using BlazorBoilerplate.Server.Models;
-using BlazorBoilerplate.Server.Services;
+using BlazorBoilerplate.Shared;
 using BlazorBoilerplate.Shared.AuthorizationDefinitions;
+using BlazorBoilerplate.Shared.DataInterfaces;
+using BlazorBoilerplate.Shared.DataModels;
+using BlazorBoilerplate.Storage;
+using BlazorBoilerplate.Storage.Mapping;
 using IdentityServer4;
 using IdentityServer4.AccessTokenValidation;
+
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using static Microsoft.AspNetCore.Http.StatusCodes;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.ResponseCompression;
+using Microsoft.Azure.KeyVault;
+using Microsoft.Azure.Services.AppAuthentication;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using System;
-using System.IO;
-using System.Linq;
-using System.Net;
+
+using Serilog;
 using System.Reflection;
-using System.Security.Cryptography.X509Certificates;
-using System.Threading.Tasks;
+using BlazorBoilerplate.Server.Data;
+
 
 namespace BlazorBoilerplate.Server
 {
@@ -48,24 +74,33 @@ namespace BlazorBoilerplate.Server
         // For more information on how to configure your application, visit https://go.microsoft.com/fwlink/?LinkID=398940
         public void ConfigureServices(IServiceCollection services)
         {
-            services.Configure<ApiBehaviorOptions>(options => { options.SuppressModelStateInvalidFilter = true; });
+            var authAuthority = Configuration["BlazorBoilerplate:IS4ApplicationUrl"].TrimEnd('/');
 
-            var migrationsAssembly = typeof(Startup).GetTypeInfo().Assembly.GetName().Name;
+            services.RegisterStorage(Configuration);
+            var migrationsAssembly = typeof(ApplicationDbContext).GetTypeInfo().Assembly.GetName();
+            var migrationsAssemblyName = migrationsAssembly.Name;
             var useSqlServer = Convert.ToBoolean(Configuration["BlazorBoilerplate:UseSqlServer"] ?? "false");
             var dbConnString = useSqlServer
                 ? Configuration.GetConnectionString("DefaultConnection")
                 : $"Filename={Configuration.GetConnectionString("SqlLiteConnectionFileName")}";
 
-            var authAuthority = Configuration["BlazorBoilerplate:IS4ApplicationUrl"].TrimEnd('/');
-
             void DbContextOptionsBuilder(DbContextOptionsBuilder builder)
             {
                 if (useSqlServer)
-                    builder.UseSqlServer(dbConnString, sql => sql.MigrationsAssembly(migrationsAssembly));
+                {
+                    builder.UseSqlServer(dbConnString, sql => sql.MigrationsAssembly(migrationsAssemblyName));
+                }
+                else if (Convert.ToBoolean(Configuration["BlazorBoilerplate:UsePostgresServer"] ?? "false"))
+                {
+                    builder.UseNpgsql(Configuration.GetConnectionString("PostgresConnection"), sql => sql.MigrationsAssembly(migrationsAssemblyName));
+                }
                 else
-                    builder.UseSqlite(dbConnString, sql => sql.MigrationsAssembly(migrationsAssembly));
+                {
+                    builder.UseSqlite(dbConnString, sql => sql.MigrationsAssembly(migrationsAssemblyName));
+                }
             }
 
+            services.Configure<ApiBehaviorOptions>(options => { options.SuppressModelStateInvalidFilter = true; });
             services.AddDbContext<ApplicationDbContext>(DbContextOptionsBuilder);
 
             services.AddIdentity<ApplicationUser, IdentityRole<Guid>>()
@@ -76,6 +111,9 @@ namespace BlazorBoilerplate.Server
             services.AddScoped<IUserClaimsPrincipalFactory<ApplicationUser>,
                 AdditionalUserClaimsPrincipalFactory>();
 
+            // cookie policy to deal with temporary browser incompatibilities
+            services.AddSameSiteCookiePolicy();
+
             // Adds IdentityServer
             var identityServerBuilder = services.AddIdentityServer(options =>
             {
@@ -85,6 +123,7 @@ namespace BlazorBoilerplate.Server
                 options.Events.RaiseFailureEvents = true;
                 options.Events.RaiseSuccessEvents = true;
             })
+              .AddIdentityServerStores(Configuration)
               .AddConfigurationStore(options =>
               {
                   options.ConfigureDbContext = DbContextOptionsBuilder;
@@ -101,6 +140,7 @@ namespace BlazorBoilerplate.Server
 
             X509Certificate2 cert = null;
 
+
             if (_environment.IsDevelopment())
             {
                 // The AddDeveloperSigningCredential extension creates temporary key material for signing tokens.
@@ -112,13 +152,46 @@ namespace BlazorBoilerplate.Server
             }
             else
             {
-                // Works for IIS, finds cert by the thumbprint in appsettings.json
-                // Make sure Certificate is in the Web Hosting folder && installed to LocalMachine or update settings below
-                var useLocalCertStore = Convert.ToBoolean(Configuration["BlazorBoilerplate:UseLocalCertStore"]);
-                var certificateThumbprint = Configuration["BlazorBoilerplate:CertificateThumbprint"];
-
-                if (useLocalCertStore)
+                // running on azure
+                // please make sure to replace your vault URI and your certificate name in appsettings.json!
+                if (Convert.ToBoolean(Configuration["HostingOnAzure:RunsOnAzure"]) == true)
                 {
+                    // if we use a key vault
+                    if (Convert.ToBoolean(Configuration["HostingOnAzure:AzurekeyVault:UsingKeyVault"]) == true)
+                    {
+
+                        // if managed app identity is used
+                        if (Convert.ToBoolean(Configuration["HostingOnAzure:AzurekeyVault:UseManagedAppIdentity"]) == true)
+                        {
+                            try
+                            {
+                                AzureServiceTokenProvider azureServiceTokenProvider = new AzureServiceTokenProvider();
+
+                                var keyVaultClient = new KeyVaultClient(new KeyVaultClient.AuthenticationCallback(azureServiceTokenProvider.KeyVaultTokenCallback));
+
+                                var certificateBundle = keyVaultClient.GetSecretAsync(Configuration["HostingOnAzure:AzureKeyVault:VaultURI"], Configuration["HostingOnAzure:AzurekeyVault:CertificateName"]).GetAwaiter().GetResult();
+                                var certificate = System.Convert.FromBase64String(certificateBundle.Value);
+                                cert = new X509Certificate2(certificate, (string)null, X509KeyStorageFlags.MachineKeySet);
+                            }
+                            catch (Exception ex)
+                            {
+                                throw (ex);
+                            }
+                        }
+
+                        // if app id and app secret are used
+                        if (Convert.ToBoolean(Configuration["HostingOnAzure:AzurekeyVault:UsingKeyVault"]) == false)
+                        {
+                            throw new NotImplementedException();
+                        }
+
+                    }
+                }
+
+                // using local cert store
+                if (Convert.ToBoolean(Configuration["BlazorBoilerplate:UseLocalCertStore"]) == true)
+                {
+                    var certificateThumbprint = Configuration["BlazorBoilerplate:CertificateThumbprint"];
                     using (X509Store store = new X509Store("WebHosting", StoreLocation.LocalMachine))
                     {
                         store.Open(OpenFlags.ReadOnly);
@@ -142,20 +215,16 @@ namespace BlazorBoilerplate.Server
                         store.Close();
                     }
                 }
+
+                // pass the resulting certificate to Identity Server
+                if (cert != null)
+                {
+                    identityServerBuilder.AddSigningCredential(cert);
+                }
                 else
                 {
-                    // Azure deployment, will be used if deployed to Azure - Not tested
-                    //var vaultConfigSection = Configuration.GetSection("Vault");
-                    //var keyVaultService = new KeyVaultCertificateService(vaultConfigSection["Url"], vaultConfigSection["ClientId"], vaultConfigSection["ClientSecret"]);
-                    ////cert = keyVaultService.GetCertificateFromKeyVault(vaultConfigSection["CertificateName"]);
-
-                    /// I was informed that this will work as a temp solution in Azure
-                    cert = new X509Certificate2("AuthSample.pfx", "Admin123",
-                        X509KeyStorageFlags.MachineKeySet |
-                        X509KeyStorageFlags.PersistKeySet |
-                        X509KeyStorageFlags.Exportable);
+                    throw new FileNotFoundException("No certificate for Identity Server could be retrieved.");
                 }
-                identityServerBuilder.AddSigningCredential(cert);
             }
 
             var authBuilder = services.AddAuthentication(options =>
@@ -182,8 +251,6 @@ namespace BlazorBoilerplate.Server
                 });
             }
 
-            services.Configure<ApiBehaviorOptions>(options => { options.SuppressModelStateInvalidFilter = true; });
-
             //Add Policies / Claims / Authorization - https://stormpath.com/blog/tutorial-policy-based-authorization-asp-net-core
             services.AddAuthorization(options =>
             {
@@ -193,7 +260,9 @@ namespace BlazorBoilerplate.Server
                 options.AddPolicy(Policies.IsMyDomain, Policies.IsMyDomainPolicy());  // valid only on serverside operations
             });
 
+            services.AddSingleton<IAuthorizationPolicyProvider, AuthorizationPolicyProvider>();
             services.AddTransient<IAuthorizationHandler, DomainRequirementHandler>();
+            services.AddTransient<IAuthorizationHandler, PermissionRequirementHandler>();
 
             services.Configure<IdentityOptions>(options =>
             {
@@ -218,9 +287,22 @@ namespace BlazorBoilerplate.Server
                 }
             });
 
+            //            services.Configure<CookiePolicyOptions>(options =>
+            //            {
+            //                options.MinimumSameSitePolicy = SameSiteMode.None;
+            //            });
+
+            //services.ConfigureExternalCookie(options =>
+            // {
+            // macOS login fix
+            //options.Cookie.SameSite = SameSiteMode.None;
+            //});
+
             services.ConfigureApplicationCookie(options =>
             {
-                options.Cookie.HttpOnly = false;
+                // macOS login fix
+                //options.Cookie.SameSite = SameSiteMode.None;
+                //options.Cookie.HttpOnly = false;
 
                 // Suppress redirect on API URLs in ASP.NET Core -> https://stackoverflow.com/a/56384729/54159
                 options.Events = new CookieAuthenticationEvents()
@@ -229,14 +311,14 @@ namespace BlazorBoilerplate.Server
                     {
                         if (context.Request.Path.StartsWithSegments("/api"))
                         {
-                            context.Response.StatusCode = (int) (HttpStatusCode.Unauthorized);
+                            context.Response.StatusCode = Status403Forbidden;
                         }
 
                         return Task.CompletedTask;
                     },
                     OnRedirectToLogin = context =>
                     {
-                        context.Response.StatusCode = 401;
+                        context.Response.StatusCode = Status401Unauthorized;
                         return Task.CompletedTask;
                     }
                 };
@@ -249,30 +331,33 @@ namespace BlazorBoilerplate.Server
             {
                 config.PostProcess = document =>
                 {
-                    document.Info.Version     = "v0.2.3";
-                    document.Info.Title       = "Blazor Boilerplate";
-                    document.Info.Description = "Blazor Boilerplate / Starter Template using the  (ASP.NET Core Hosted) (dotnet new blazorhosted) model. Hosted by an ASP.NET Core server";
+                    document.Info.Version = migrationsAssembly.Version.ToString();
+                    document.Info.Title = "Blazor Boilerplate";
+#if ServerSideBlazor
+                    document.Info.Description = "Blazor Boilerplate / Starter Template using the  Server Side Version";
+#endif
+#if ClientSideBlazor
+                    document.Info.Description = "Blazor Boilerplate / Starter Template using the Client Side / Webassembly Version.";
+#endif
                 };
             });
 
-            services.AddResponseCompression(opts =>
-            {
-                opts.MimeTypes = ResponseCompressionDefaults.MimeTypes.Concat(
-                    new[] { "application/octet-stream" });
-            });
+            services.AddScoped<IUserSession, UserSession>();
 
             services.AddSingleton<IHttpContextAccessor, HttpContextAccessor>();
-            services.AddScoped<IUserSession, UserSession>();
             services.AddSingleton<IEmailConfiguration>(Configuration.GetSection("EmailConfiguration").Get<EmailConfiguration>());
-            services.AddTransient<IAccountService, AccountService>();
-            services.AddTransient<IEmailService, EmailService>();
-            services.AddTransient<IUserProfileService, UserProfileService>();
-            services.AddTransient<IApiLogService, ApiLogService>();
-            services.AddTransient<ITodoService, ToDoService>();
-            services.AddTransient<IMessageService, MessageService>();
 
-            // DB Creation and Seeding
-            services.AddTransient<IDatabaseInitializer, DatabaseInitializer>();
+            services.AddTransient<IAccountManager, AccountManager>();
+            services.AddTransient<IAdminManager, AdminManager>();
+            services.AddTransient<IApiLogManager, ApiLogManager>();
+            services.AddTransient<IDbLogManager, DbLogManager>();
+            services.AddTransient<IEmailManager, EmailManager>();
+            services.AddTransient<IExternalAuthManager, ExternalAuthManager>(); // Currently not being used.
+            services.AddTransient<IMessageManager, MessageManager>();
+            services.AddTransient<ITodoManager, ToDoManager>();
+            services.AddTransient<IUserProfileManager, UserProfileManager>();
+
+
 
             //Automapper to map DTO to Models https://www.c-sharpcorner.com/UploadFile/1492b1/crud-operations-using-automapper-in-mvc-application/
             var automapperConfig = new MapperConfiguration(configuration =>
@@ -283,11 +368,55 @@ namespace BlazorBoilerplate.Server
             var autoMapper = automapperConfig.CreateMapper();
 
             services.AddSingleton(autoMapper);
+
+#if ServerSideBlazor
+
+            services.AddScoped<IAuthorizeApi, AuthorizeApi>();
+            services.AddScoped<IUserProfileApi, UserProfileApi>();
+            services.AddScoped<AppState>();
+            services.AddMatToaster(config =>
+            {
+                config.Position = MatToastPosition.BottomRight;
+                config.PreventDuplicates = true;
+                config.NewestOnTop = true;
+                config.ShowCloseButton = true;
+                config.MaximumOpacity = 95;
+                config.VisibleStateDuration = 3000;
+            });
+
+            // Setup HttpClient for server side
+            services.AddScoped<HttpClient>();
+
+            services.AddRazorPages();
+            services.AddServerSideBlazor();
+
+            // Authentication providers
+
+            Log.Logger.Debug("Removing AuthenticationStateProvider...");
+            var serviceDescriptor = services.FirstOrDefault(descriptor => descriptor.ServiceType == typeof(AuthenticationStateProvider));
+            if (serviceDescriptor != null)
+            {
+                services.Remove(serviceDescriptor);
+            }
+
+            Log.Logger.Debug("Adding AuthenticationStateProvider...");
+            services.AddScoped<AuthenticationStateProvider, IdentityAuthenticationStateProvider>();
+
+#endif
+
+            Log.Logger.Debug($"Total Services Registered: {services.Count}");
+            foreach (var service in services)
+            {
+                Log.Logger.Debug($"\n      Service: {service.ServiceType.FullName}\n      Lifetime: {service.Lifetime}\n      Instance: {service.ImplementationType?.FullName}");
+            }
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
         {
+            // cookie policy to deal with temporary browser incompatibilities
+            app.UseCookiePolicy();
+
             EmailTemplates.Initialize(env);
 
             using (var serviceScope = app.ApplicationServices.GetRequiredService<IServiceScopeFactory>().CreateScope())
@@ -296,8 +425,6 @@ namespace BlazorBoilerplate.Server
                 databaseInitializer.SeedAsync().Wait();
             }
 
-            app.UseResponseCompression(); // This must be before the other Middleware if that manipulates Response
-
             // A REST API global exception handler and response wrapper for a consistent API
             // Configure API Loggin in appsettings.json - Logs most API calls. Great for debugging and user activity audits
             app.UseMiddleware<APIResponseRequestLoggingMiddleware>(Convert.ToBoolean(Configuration["BlazorBoilerplate:EnableAPILogging:Enabled"] ?? "true"));
@@ -305,24 +432,29 @@ namespace BlazorBoilerplate.Server
             if (env.IsDevelopment())
             {
                 app.UseDeveloperExceptionPage();
-                app.UseBlazorDebugging();
+#if ClientSideBlazor
+                app.UseWebAssemblyDebugging();
+#endif
             }
             else
             {
-              // The default HSTS value is 30 days. You may want to change this for production scenarios, see https://aka.ms/aspnetcore-hsts.
-              //    app.UseHsts(); //HSTS Middleware (UseHsts) to send HTTP Strict Transport Security Protocol (HSTS) headers to clients.
+                // The default HSTS value is 30 days. You may want to change this for production scenarios, see https://aka.ms/aspnetcore-hsts.
+                //    app.UseHsts(); //HSTS Middleware (UseHsts) to send HTTP Strict Transport Security Protocol (HSTS) headers to clients.
             }
 
-            //app.UseStaticFiles();
-            app.UseClientSideBlazorFiles<Client.Startup>();
-
             app.UseHttpsRedirection();
+            app.UseStaticFiles();
+
+#if ClientSideBlazor
+            app.UseBlazorFrameworkFiles();
+#endif
+
             app.UseRouting();
-            //app.UseAuthentication();
+            //app.UseAuthentication(); //Removed for IS4
             app.UseIdentityServer();
             app.UseAuthorization();
 
-            //must be AFTER the Auth middleware to get the User/Identity info
+            //Must be AFTER the Auth middleware to get the User/Identity info
             app.UseMiddleware<UserSessionMiddleware>();
 
             // NSwag
@@ -335,8 +467,15 @@ namespace BlazorBoilerplate.Server
                 endpoints.MapControllers();
                 // new SignalR endpoint routing setup
                 endpoints.MapHub<Hubs.ChatHub>("/chathub");
-                endpoints.MapFallbackToClientSideBlazor<Client.Startup>("index.html");
+
+#if ClientSideBlazor
+                endpoints.MapFallbackToFile("index_csb.html");
+#else
+                endpoints.MapBlazorHub();
+                endpoints.MapFallbackToPage("/index_ssb");
+#endif
             });
+
         }
     }
 }
